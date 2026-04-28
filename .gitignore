@@ -1,0 +1,20 @@
+# Build artifacts
+minios
+*.o
+*.dSYM/
+
+# Program binaries
+programs/bin/
+
+# Node.js
+node_modules/
+
+# OS files
+.DS_Store
+
+# Log files
+*.log
+
+# Socket files
+/tmp/minios.sock
+/tmp/minios_*.sock
