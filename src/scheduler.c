@@ -110,52 +110,116 @@ void scheduler_stop(void) {
 // ============================================================
 int scheduler_create_process(const char *path, const char *arg) {
     // Paso 1. Validar que hay espacio en process_table.
-    //         Si process_count >= MAX_PROCESSES, imprimir error y retornar -1.
+    if (process_count >= MAX_PROCESSES) {
+        fprintf(stderr, "Error: se alcanzó el máximo de procesos (%d).\n", MAX_PROCESSES);
+        return -1;
+    }
 
-    // Paso 2. Llamar fork() y guardar el resultado en una variable pid_t.
-    //         Si fork() retorna < 0, es error: perror("fork") y retornar -1.
+    // Paso 2. fork().
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return -1;
+    }
 
-    // Paso 3. Si estamos en el HIJO (pid == 0):
-    //         a) Si platform_uses_ptrace() retorna verdadero, llamar platform_trace_child().
-    //            (En macOS esto es no-op; en Linux habilita ptrace.)
-    //         b) Llamar execl(path, path, arg, NULL) si arg != NULL,
-    //            o execl(path, path, NULL) si arg == NULL.
-    //         c) Si execl retorna, falló: perror("execl") y _exit(1).
+    // Paso 3. Ruta del hijo: habilitar tracing (Linux) y hacer exec.
+    if (pid == 0) {
+        if (platform_uses_ptrace()) {
+            if (platform_trace_child() < 0) {
+                perror("platform_trace_child");
+                _exit(1);
+            }
+        }
 
-    // Paso 4. Si estamos en el PADRE (pid > 0) Y platform_uses_ptrace() es verdadero:
-    //         a) waitpid(pid, &status, 0) para esperar el SIGTRAP post-exec.
-    //         b) Verificar WIFSTOPPED(status). Si no está detenido: matar al hijo y retornar -1.
+        if (arg != NULL) {
+            execl(path, path, arg, NULL);
+        } else {
+            execl(path, path, NULL);
+        }
 
-    // Paso 5. Crear la entrada en el PCB:
-    //         - Calcular idx = process_count (índice libre en la tabla)
-    //         - Obtener nombre corto con basename() sobre una copia de path
-    //         - Llamar pcb_init(&process_table[idx], pid, short_name)
-    //         - Liberar la copia del path
-    //
-    //         Ejemplo:
-    //             char *path_copy = strdup(path);
-    //             char *short_name = basename(path_copy);
-    //             pcb_init(&process_table[idx], pid, short_name);
-    //             free(path_copy);
+        // Si llegamos aquí, execl falló.
+        perror("execl");
+        _exit(1);
+    }
 
-    // Paso 6. (Solo si platform_uses_ptrace()) Intentar capturar registros iniciales:
-    //         a) Si platform_get_registers(pid, &process_table[idx].registers) retorna 0,
-    //            marcar process_table[idx].regs_valid = 1.
-    //         b) Llamar platform_detach(pid) para liberar el tracing.
+    int status = 0;
 
-    // Paso 7. Detener el proceso con platform_stop_process(pid).
-    //         Si falla: perror, matar, retornar -1.
+    // Paso 4. En Linux con ptrace: esperar el SIGTRAP post-exec.
+    if (platform_uses_ptrace()) {
+        if (waitpid(pid, &status, 0) < 0) {
+            perror("waitpid");
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            return -1;
+        }
+        if (!WIFSTOPPED(status)) {
+            fprintf(stderr, "Error: el hijo no quedó detenido tras exec (status=%d).\n", status);
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            return -1;
+        }
+    }
 
-    // Paso 8. waitpid(pid, &status, WUNTRACED) para confirmar que se detuvo.
-    //         Si falla: perror, matar, retornar -1.
+    // Paso 5. Inicializar PCB con un nombre corto (basename) para la UI.
+    int idx = process_count;
+    const char *pcb_name = path;
+    char *path_copy = strdup(path);
+    if (path_copy != NULL) {
+        pcb_name = basename(path_copy);
+    }
+    pcb_init(&process_table[idx], pid, pcb_name);
+    free(path_copy);
 
-    // Paso 9. Marcar el PCB como PROC_READY, incrementar process_count,
-    //         llamar rq_enqueue(idx), emitir monitor_emit_created(pid, name)
-    //         y si regs_valid, monitor_emit_registers(pid, pc, sp).
-    //         Retornar idx.
+    // Paso 6. (Linux/ptrace) Capturar registros iniciales si es posible.
+    if (platform_uses_ptrace()) {
+        if (platform_get_registers(pid, &process_table[idx].registers) == 0) {
+            process_table[idx].regs_valid = 1;
+        }
+        // Importante: dejamos el proceso detenido con SIGSTOP antes de soltar ptrace.
+        if (platform_stop_process(pid) < 0) {
+            perror("platform_stop_process");
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            return -1;
+        }
+        if (platform_detach(pid) < 0) {
+            perror("platform_detach");
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            return -1;
+        }
+    } else {
+        // En plataformas sin ptrace, al menos detenemos el proceso explícitamente.
+        if (platform_stop_process(pid) < 0) {
+            perror("platform_stop_process");
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            return -1;
+        }
+    }
 
-    (void)path; (void)arg;  // silence unused warnings while unimplemented
-    return -1;  // TODO: reemplazar por idx real
+    // Paso 8. Confirmar que el proceso quedó detenido (estado 'T').
+    if (waitpid(pid, &status, WUNTRACED) < 0) {
+        perror("waitpid");
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        return -1;
+    }
+
+    // Paso 9. Marcar READY, encolar y emitir evento de creación.
+    process_table[idx].state = PROC_READY;
+
+    if (rq_enqueue(idx) < 0) {
+        fprintf(stderr, "Error: no se pudo encolar el proceso en la ready queue.\n");
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        process_table[idx].state = PROC_TERMINATED;
+        return -1;
+    }
+
+    process_count++;
+    monitor_emit_created(process_table[idx].pid, process_table[idx].name);
+    return idx;
 }
 
 
@@ -187,7 +251,37 @@ void scheduler_start(int slice_ms) {
     //         - timer_init(slice_ms, scheduler_tick);  // registra el handler
     //         - timer_start();                         // arranca setitimer
 
-    (void)slice_ms;  // silence unused while unimplemented
+    // Paso 1. Si la cola está vacía, no hay nada que ejecutar.
+    if (rq_is_empty()) {
+        printf("No hay procesos en la ready queue.\n");
+        return;
+    }
+
+    // Paso 2. Desencolar el primer proceso.
+    int idx = rq_dequeue();
+    if (idx < 0) {
+        printf("No hay procesos en la ready queue.\n");
+        return;
+    }
+
+    // Paso 3. Actualizar PCB entrante y registrar timestamp.
+    process_table[idx].state = PROC_RUNNING;
+    clock_gettime(CLOCK_MONOTONIC, &process_table[idx].last_started);
+    current_running = idx;
+
+    // Paso 4. Reanudar el proceso.
+    if (platform_resume_process(process_table[idx].pid) < 0) {
+        perror("platform_resume_process");
+        process_table[idx].state = PROC_READY;
+        current_running = -1;
+        rq_enqueue(idx);
+        return;
+    }
+
+    // Paso 5. Activar el scheduler y arrancar el timer periódico.
+    scheduler_active = 1;
+    timer_init(slice_ms, scheduler_tick);
+    timer_start();
 }
 
 
