@@ -209,7 +209,34 @@ static void cmd_run(const char *path, const char *arg) {
     //         arrancar el scheduler con timer_get_slice() como slice:
     //         scheduler_start(timer_get_slice());
 
-    (void)path; (void)arg;  // silence unused while unimplemented
+    // Nota: este comando se ejecuta con SIGALRM bloqueada desde shell_run().
+    // Eso evita races con el scheduler mientras se crea/encola el proceso.
+
+    // Paso 1. Validación básica de argumentos.
+    if (!path || strlen(path) == 0) {
+        printf("Uso: run <binario> [argumento]\n");
+        return;
+    }
+
+    // Paso 2. Validar que el binario existe y es ejecutable.
+    if (access(path, X_OK) != 0) {
+        perror("access");
+        return;
+    }
+
+    // Paso 3. Crear el proceso a través del scheduler.
+    int idx = scheduler_create_process(path, arg);
+    if (idx < 0) {
+        // scheduler_create_process ya reporta el error principal.
+        return;
+    }
+
+    // Paso 4. Si el scheduler no está corriendo, arrancarlo con el slice actual.
+    if (!scheduler_is_running() && !rq_is_empty()) {
+        scheduler_start(timer_get_slice());
+    }
+
+    printf("Proceso creado: PID %d (%s)\n", process_table[idx].pid, process_table[idx].name);
 }
 
 
@@ -230,20 +257,26 @@ static void cmd_run(const char *path, const char *arg) {
 // rq_print() (que imprime algo como "Ready Queue: PID 1235 -> PID 1234").
 // ============================================================
 static void cmd_ps(void) {
-    // Paso 1. block_alarm() para proteger la lectura de process_table.
+    // Paso 1. Proteger la lectura de la process table y la ready queue.
+    block_alarm();
 
-    // Paso 2. Si process_count == 0: imprimir "No hay procesos." y retornar
-    //         (recuerda hacer unblock_alarm antes de retornar!).
+    // Paso 2. Caso base.
+    if (process_count == 0) {
+        printf("No hay procesos.\n");
+        unblock_alarm();
+        return;
+    }
 
-    // Paso 3. Imprimir un salto de linea + llamar pcb_print_table().
+    // Paso 3. Mostrar tabla (incluye procesos TERMINATED para ver historial).
+    printf("\n");
+    pcb_print_table();
 
-    // Paso 4. Imprimir otro salto de linea + llamar rq_print().
+    // Paso 4. Mostrar ready queue actual.
+    printf("\n");
+    rq_print();
 
-    // Paso 5. unblock_alarm() al terminar.
-    //
-    // Pista: puedes implementar esto desde cero con tu propio formato
-    // si prefieres. Los campos del PCB estan en pcb_t (ver pcb.h):
-    //   pid, name, state, cpu_time_ms, wait_time_ms, context_switches
+    // Paso 5. Restaurar máscara.
+    unblock_alarm();
 }
 
 
