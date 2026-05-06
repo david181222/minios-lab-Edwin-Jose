@@ -422,8 +422,8 @@ void shell_run(void) {
     sigaddset(&alarm_mask, SIGALRM);
 
     printf("+----------------------------------+\n");
-    printf("|       miniOS v1.0                |\n");
-    printf("|   Simulador de Context Switching |\n");
+    printf("|       miniOS v1.1                |\n");
+    printf("|   Kept you waiting, huh?         |\n");
     printf("|   Escribe 'help' para ayuda      |\n");
     printf("+----------------------------------+\n\n");
 
