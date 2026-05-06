@@ -304,35 +304,49 @@ void scheduler_start(int slice_ms) {
 void scheduler_tick(int signum) {
     (void)signum;
 
-    // Paso 1. Salida temprana: si current_running < 0 o !scheduler_active, return.
+    // Paso 1. Salida temprana si no hay proceso corriendo o el scheduler está parado.
+    if (current_running < 0 || !scheduler_active) {
+        return;
+    }
 
-    // Paso 2. Obtener puntero al PCB del proceso actual:
-    //         pcb_t *current = &process_table[current_running];
+    // Paso 2. Puntero al PCB del proceso saliente.
+    int prev_idx = current_running;
+    pcb_t *current = &process_table[prev_idx];
 
-    // Paso 3. Detener el proceso actual con platform_stop_process(current->pid).
+    // Paso 3. Detener al proceso actual.
+    platform_stop_process(current->pid);
 
-    // Paso 4. Actualizar PCB del saliente:
-    //         - Obtener tiempo actual con clock_gettime(CLOCK_MONOTONIC, &now).
-    //         - Calcular elapsed = timespec_diff_ms(now, current->last_started).
-    //         - current->cpu_time_ms += elapsed;
-    //         - current->state = PROC_READY;
-    //         - current->context_switches++;
+    // Paso 4. Actualizar contadores del PCB saliente.
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double elapsed = timespec_diff_ms(now, current->last_started);
+    current->cpu_time_ms += elapsed;
+    current->state = PROC_READY;
+    current->context_switches++;
 
-    // Paso 5. Encolar el proceso saliente con rq_enqueue(current_running).
+    // Paso 5. Volver a encolar al saliente al final de la ready queue.
+    rq_enqueue(prev_idx);
 
-    // Paso 6. Si la cola quedó vacía (rq_is_empty()):
-    //         - current_running = -1;
-    //         - timer_stop();
-    //         - return;
+    // Paso 6. Si la cola quedó vacía (no debería ocurrir tras enqueue, pero
+    //         es una guarda defensiva), el sistema queda idle.
+    if (rq_is_empty()) {
+        current_running = -1;
+        timer_stop();
+        return;
+    }
 
-    // Paso 7. Desencolar el siguiente, actualizar su PCB y reanudarlo:
-    //         - int next_idx = rq_dequeue();
-    //         - pcb_t *next = &process_table[next_idx];
-    //         - next->state = PROC_RUNNING;
-    //         - clock_gettime(CLOCK_MONOTONIC, &next->last_started);
-    //         - platform_resume_process(next->pid);
-    //         - monitor_emit_switch(current->pid, next->pid, timer_get_slice());
-    //         - current_running = next_idx;
+    // Paso 7. Desencolar el siguiente proceso y ponerlo a correr.
+    int next_idx = rq_dequeue();
+    if (next_idx < 0) {
+        current_running = -1;
+        return;
+    }
+    pcb_t *next = &process_table[next_idx];
+    next->state = PROC_RUNNING;
+    clock_gettime(CLOCK_MONOTONIC, &next->last_started);
+    platform_resume_process(next->pid);
+    monitor_emit_switch(current->pid, next->pid, timer_get_slice());
+    current_running = next_idx;
 }
 
 
@@ -351,28 +365,60 @@ void scheduler_tick(int signum) {
 void scheduler_sigchld(int signum) {
     (void)signum;
 
-    // Paso 1. Loop while waitpid(-1, &status, WNOHANG | WUNTRACED) > 0:
-    //         - WNOHANG para no bloquear.
-    //         - El loop recoge todos los hijos terminados pendientes.
+    int status;
+    pid_t pid;
 
-    // Paso 2. Dentro del loop, IGNORAR paradas: si !WIFEXITED(status) y
-    //         !WIFSIGNALED(status), continue (el proceso solo se detuvo,
-    //         no terminó).
+    // Paso 1. Recoger TODOS los hijos terminados pendientes en un loop no-bloqueante.
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+        // Paso 2. Solo nos interesan terminaciones (no paradas SIGSTOP/SIGCONT).
+        if (!WIFEXITED(status) && !WIFSIGNALED(status)) {
+            continue;
+        }
 
-    // Paso 3. Buscar el PID en process_table (loop por los process_count).
-    //         Ignorar si ya está PROC_TERMINATED.
+        // Paso 3. Buscar el PID en la process_table.
+        int idx = -1;
+        for (int i = 0; i < process_count; i++) {
+            if (process_table[i].pid == pid) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0 || process_table[idx].state == PROC_TERMINATED) {
+            continue;
+        }
 
-    // Paso 4. Marcar process_table[i].state = PROC_TERMINATED y
-    //         llamar monitor_emit_terminated(pid, cpu_time_ms, context_switches).
+        // Paso 5a. Si era el proceso RUNNING, acumular el último tramo de CPU.
+        if (idx == current_running) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed = timespec_diff_ms(now, process_table[idx].last_started);
+            process_table[idx].cpu_time_ms += elapsed;
+        }
 
-    // Paso 5. Si i == current_running (el que terminó era el que corría):
-    //         a) Actualizar cpu_time_ms con el elapsed desde last_started.
-    //         b) current_running = -1;
-    //         c) Si !rq_is_empty(): desencolar siguiente, marcarlo RUNNING,
-    //            registrar last_started y platform_resume_process.
-    //            Luego current_running = next.
-    //         d) Si rq_is_empty(): timer_stop(); scheduler_active = 0;
+        // Paso 4. Marcar como terminado y emitir evento al monitor.
+        process_table[idx].state = PROC_TERMINATED;
+        monitor_emit_terminated(pid,
+                                process_table[idx].cpu_time_ms,
+                                process_table[idx].context_switches);
 
-    // Paso 6. Si i != current_running (estaba en la cola esperando):
-    //         rq_remove(i);
+        if (idx == current_running) {
+            // Paso 5b/c/d. Despachar el siguiente proceso, o quedar idle.
+            current_running = -1;
+            if (!rq_is_empty()) {
+                int next_idx = rq_dequeue();
+                if (next_idx >= 0) {
+                    process_table[next_idx].state = PROC_RUNNING;
+                    clock_gettime(CLOCK_MONOTONIC, &process_table[next_idx].last_started);
+                    platform_resume_process(process_table[next_idx].pid);
+                    current_running = next_idx;
+                }
+            } else {
+                timer_stop();
+                scheduler_active = 0;
+            }
+        } else {
+            // Paso 6. Estaba esperando en la ready queue: removerlo.
+            rq_remove(idx);
+        }
+    }
 }

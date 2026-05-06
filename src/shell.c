@@ -292,27 +292,62 @@ static void cmd_ps(void) {
 // inmediatamente y que `ps` refleje el cambio al instante.
 // ============================================================
 static void cmd_kill_proc(const char *arg) {
-    // Paso 1. Si arg es NULL o vacio, imprimir "Uso: kill <pid>" y retornar.
+    // Paso 1. Validar argumento.
+    if (!arg || strlen(arg) == 0) {
+        printf("Uso: kill <pid>\n");
+        return;
+    }
 
-    // Paso 2. Convertir arg a entero con atoi. Si <= 0, imprimir "PID invalido"
-    //         y retornar.
+    // Paso 2. Parsear PID.
+    int target_pid = atoi(arg);
+    if (target_pid <= 0) {
+        printf("PID invalido.\n");
+        return;
+    }
 
-    // Paso 3. block_alarm() para proteger la lectura/modificacion.
+    // Paso 3. Bloquear SIGALRM y SIGCHLD para serializar con scheduler_tick y
+    //         scheduler_sigchld. SIGCHLD se mantiene pendiente hasta el final;
+    //         al desbloquearlo, el handler hará el cleanup completo (waitpid,
+    //         marcar PROC_TERMINATED, despachar el siguiente proceso).
+    sigset_t kill_mask, old_mask;
+    sigemptyset(&kill_mask);
+    sigaddset(&kill_mask, SIGALRM);
+    sigaddset(&kill_mask, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &kill_mask, &old_mask);
 
-    // Paso 4. Buscar el PID en process_table (loop por process_count):
-    //         - Si process_table[i].pid == target_pid Y estado != PROC_TERMINATED:
-    //           a) kill(target_pid, SIGKILL);
-    //           b) waitpid(target_pid, &status, 0);  // limpiar zombie
-    //           c) process_table[i].state = PROC_TERMINATED;
-    //           d) rq_remove(i);  // sacar de la ready queue
-    //           e) imprimir "Proceso PID <pid> terminado."
-    //           f) break;
+    // Paso 4. Buscar el PID en process_table.
+    int found = 0;
+    for (int i = 0; i < process_count; i++) {
+        if (process_table[i].pid == target_pid &&
+            process_table[i].state != PROC_TERMINATED) {
 
-    // Paso 5. Si no se encontro, imprimir mensaje de error.
+            // Si está esperando en la cola, sacarlo ahora. Si está RUNNING,
+            // no está encolado: scheduler_sigchld despachará el siguiente
+            // cuando se desbloquee SIGCHLD.
+            if (process_table[i].state != PROC_RUNNING) {
+                rq_remove(i);
+            }
 
-    // Paso 6. unblock_alarm() al terminar.
+            // Enviar SIGKILL: el kernel marcará el proceso como zombie y
+            // generará SIGCHLD (pendiente hasta que desbloqueemos).
+            if (kill(target_pid, SIGKILL) < 0) {
+                perror("kill");
+            } else {
+                printf("Proceso PID %d terminado.\n", target_pid);
+            }
+            found = 1;
+            break;
+        }
+    }
 
-    (void)arg;  // silence unused while unimplemented
+    if (!found) {
+        printf("Proceso PID %d no encontrado.\n", target_pid);
+    }
+
+    // Paso 6. Restaurar la máscara de señales. El SIGCHLD pendiente se
+    //         entrega aquí y scheduler_sigchld realiza waitpid + transición
+    //         de estado + dispatch del siguiente proceso de manera atómica.
+    sigprocmask(SIG_SETMASK, &old_mask, NULL);
 }
 
 
@@ -338,25 +373,41 @@ static void cmd_kill_proc(const char *arg) {
 //     Avg espera:            230.5 ms
 // ============================================================
 static void cmd_stats(void) {
-    // Paso 1. block_alarm() para proteger la lectura.
+    // Paso 1. Bloquear SIGALRM mientras leemos la process_table.
+    block_alarm();
 
-    // Paso 2. Declarar acumuladores:
-    //         int active = 0, terminated = 0;
-    //         double total_cpu = 0, total_wait = 0;
-    //         int total_switches = 0;
+    // Paso 2. Acumuladores.
+    int active = 0, terminated = 0;
+    double total_cpu = 0.0, total_wait = 0.0;
+    int total_switches = 0;
 
-    // Paso 3. Recorrer process_table sumando:
-    //         - Si state == PROC_TERMINATED: terminated++;  else active++;
-    //         - total_cpu += process_table[i].cpu_time_ms;
-    //         - total_wait += process_table[i].wait_time_ms;
-    //         - total_switches += process_table[i].context_switches;
+    // Paso 3. Recorrer la process_table sumando métricas.
+    for (int i = 0; i < process_count; i++) {
+        if (process_table[i].state == PROC_TERMINATED) {
+            terminated++;
+        } else {
+            active++;
+        }
+        total_cpu      += process_table[i].cpu_time_ms;
+        total_wait     += process_table[i].wait_time_ms;
+        total_switches += process_table[i].context_switches;
+    }
 
-    // Paso 4. Imprimir las estadisticas con los campos arriba.
-    //         Usar timer_get_slice() para el slice actual.
-    //         Si process_count > 0, imprimir tambien los promedios
-    //         (total_cpu / process_count) y (total_wait / process_count).
+    // Paso 4. Imprimir las estadisticas.
+    printf("\n=== Estadisticas del Scheduler ===\n");
+    printf("  Procesos activos:      %d\n", active);
+    printf("  Procesos terminados:   %d\n", terminated);
+    printf("  Time slice actual:     %d ms\n", timer_get_slice());
+    printf("  CPU total acumulado:   %.1f ms\n", total_cpu);
+    printf("  Context switches:      %d\n", total_switches);
+    if (process_count > 0) {
+        printf("  Avg CPU por proceso:   %.1f ms\n", total_cpu / process_count);
+        printf("  Avg espera:            %.1f ms\n", total_wait / process_count);
+    }
+    printf("\n");
 
-    // Paso 5. unblock_alarm().
+    // Paso 5. Restaurar máscara.
+    unblock_alarm();
 }
 
 
