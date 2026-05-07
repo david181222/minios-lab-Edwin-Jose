@@ -41,12 +41,22 @@
 
 #define MAX_LINE 256
 
+// ANSI color helpers (enabled only for TTY output)
+#define CLR_RESET "\x1b[0m"
+#define CLR_BOLD "\x1b[1m"
+#define CLR_BLUE "\x1b[34m"
+#define CLR_GREEN "\x1b[32m"
+#define CLR_RED "\x1b[31m"
+
 // ============================================================
 // Helpers y comandos ya implementados — NO los modifiques
 // ============================================================
 
 // Block SIGALRM while modifying shared state
 static sigset_t alarm_mask;
+static int shell_use_color = 0;
+
+#define COLOR(code) (shell_use_color ? (code) : "")
 
 static void block_alarm(void) {
     sigprocmask(SIG_BLOCK, &alarm_mask, NULL);
@@ -57,7 +67,7 @@ static void unblock_alarm(void) {
 }
 
 static void cmd_help(void) {
-    printf("\nComandos disponibles:\n");
+    printf("\n%sComandos disponibles:%s\n", COLOR(CLR_BOLD), COLOR(CLR_RESET));
     printf("  run <binario>       Lanzar un proceso nuevo\n");
     printf("  ps                  Mostrar tabla de procesos\n");
     printf("  kill <pid>          Terminar un proceso\n");
@@ -272,8 +282,9 @@ static void cmd_ps(void) {
     pcb_print_table();
 
     // Paso 4. Mostrar ready queue actual.
-    printf("\n");
+    printf("\n%s", COLOR(CLR_RED));
     rq_print();
+    printf("%s", COLOR(CLR_RESET));
 
     // Paso 5. Restaurar máscara.
     unblock_alarm();
@@ -394,15 +405,15 @@ static void cmd_stats(void) {
     }
 
     // Paso 4. Imprimir las estadisticas.
-    printf("\n=== Estadisticas del Scheduler ===\n");
-    printf("  Procesos activos:      %d\n", active);
-    printf("  Procesos terminados:   %d\n", terminated);
-    printf("  Time slice actual:     %d ms\n", timer_get_slice());
-    printf("  CPU total acumulado:   %.1f ms\n", total_cpu);
-    printf("  Context switches:      %d\n", total_switches);
+    printf("\n%s=== Estadisticas del Scheduler ===%s\n", COLOR(CLR_RED), COLOR(CLR_RESET));
+    printf("%s  Procesos activos:%s      %d\n", COLOR(CLR_RED), COLOR(CLR_RESET), active);
+    printf("%s  Procesos terminados:%s   %d\n", COLOR(CLR_RED), COLOR(CLR_RESET), terminated);
+    printf("%s  Time slice actual:%s     %d ms\n", COLOR(CLR_RED), COLOR(CLR_RESET), timer_get_slice());
+    printf("%s  CPU total acumulado:%s   %.1f ms\n", COLOR(CLR_RED), COLOR(CLR_RESET), total_cpu);
+    printf("%s  Context switches:%s      %d\n", COLOR(CLR_RED), COLOR(CLR_RESET), total_switches);
     if (process_count > 0) {
-        printf("  Avg CPU por proceso:   %.1f ms\n", total_cpu / process_count);
-        printf("  Avg espera:            %.1f ms\n", total_wait / process_count);
+        printf("%s  Avg CPU por proceso:%s   %.1f ms\n", COLOR(CLR_RED), COLOR(CLR_RESET), total_cpu / process_count);
+        printf("%s  Avg espera:%s            %.1f ms\n", COLOR(CLR_RED), COLOR(CLR_RESET), total_wait / process_count);
     }
     printf("\n");
 
@@ -421,14 +432,16 @@ void shell_run(void) {
     sigemptyset(&alarm_mask);
     sigaddset(&alarm_mask, SIGALRM);
 
-    printf("+----------------------------------+\n");
-    printf("|       miniOS v1.1                |\n");
-    printf("|   Kept you waiting, huh?         |\n");
-    printf("|   Escribe 'help' para ayuda      |\n");
-    printf("+----------------------------------+\n\n");
+    shell_use_color = isatty(STDOUT_FILENO) && getenv("NO_COLOR") == NULL;
+
+    printf("%s+----------------------------------+%s\n", COLOR(CLR_BLUE), COLOR(CLR_RESET));
+    printf("%s|       miniOS v1.1                |%s\n", COLOR(CLR_BLUE), COLOR(CLR_RESET));
+    printf("%s|   Kept you waiting, huh?         |%s\n", COLOR(CLR_BLUE), COLOR(CLR_RESET));
+    printf("%s|   Escribe 'help' para ayuda      |%s\n", COLOR(CLR_BLUE), COLOR(CLR_RESET));
+    printf("%s+----------------------------------+%s\n\n", COLOR(CLR_BLUE), COLOR(CLR_RESET));
 
     while (1) {
-        printf("miniOS> ");
+        printf("%s%sminiOS>%s ", COLOR(CLR_BOLD), COLOR(CLR_GREEN), COLOR(CLR_RESET));
         fflush(stdout);
 
         if (fgets(line, sizeof(line), stdin) == NULL) {
